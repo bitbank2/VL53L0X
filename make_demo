@@ -1,0 +1,13 @@
+CFLAGS=-c -Wall -O2
+LIBS = -ltof
+
+all: tofdemo
+
+tofdemo: make_demo main.o
+	$(CC) main.o $(LIBS) -o tofdemo
+
+main.o: main.c
+	$(CC) $(CFLAGS) main.c
+
+clean:
+	rm *.o tofdemo
