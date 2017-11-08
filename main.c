@@ -33,7 +33,7 @@ int model, revision;
 
 	// For Raspberry Pi's, the I2C channel is usually 1
 	// For other boards (e.g. OrangePi) it's 0
-	i = tofInit(0, 0x29);
+	i = tofInit(0, 0x29, 1); // set long range mode (up to 2m)
 	if (i != 1)
 	{
 		return -1; // problem - quit
@@ -46,7 +46,8 @@ int model, revision;
 	for (i=0; i<1200; i++) // read values 20 times a second for 1 minute
 	{
 		iDistance = tofReadDistance();
-		printf("Distance = %dmm\n", iDistance);
+		if (iDistance < 4096) // valid range?
+			printf("Distance = %dmm\n", iDistance);
 		usleep(50000); // 50ms
 	}
 

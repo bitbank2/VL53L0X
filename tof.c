@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -30,15 +31,23 @@ static unsigned short readReg16(unsigned char ucAddr);
 static void writeReg16(unsigned char ucAddr, unsigned short usValue);
 static void writeReg(unsigned char ucAddr, unsigned char ucValue);
 static void writeRegList(unsigned char *ucList);
-static int initSensor(void);
+static int initSensor(int);
+static int performSingleRefCalibration(uint8_t vhv_init_byte);
+static int setMeasurementTimingBudget(uint32_t budget_us);
 
 #define calcMacroPeriod(vcsel_period_pclks) ((((uint32_t)2304 * (vcsel_period_pclks) * 1655) + 500) / 1000)
+// Encode VCSEL pulse period register value from period in PCLKs
+// based on VL53L0X_encode_vcsel_period()
+#define encodeVcselPeriod(period_pclks) (((period_pclks) >> 1) - 1)
 
 #define SEQUENCE_ENABLE_FINAL_RANGE 0x80
 #define SEQUENCE_ENABLE_PRE_RANGE   0x40
 #define SEQUENCE_ENABLE_TCC         0x10
 #define SEQUENCE_ENABLE_DSS         0x08
 #define SEQUENCE_ENABLE_MSRC        0x04
+
+typedef enum vcselperiodtype { VcselPeriodPreRange, VcselPeriodFinalRange } vcselPeriodType;
+static int setVcselPulsePeriod(vcselPeriodType type, uint8_t period_pclks);
 
 typedef struct tagSequenceStepTimeouts
     {
@@ -55,9 +64,18 @@ typedef struct tagSequenceStepTimeouts
 
 #define REG_RESULT_INTERRUPT_STATUS 		0x13
 #define RESULT_RANGE_STATUS      		0x14
+#define ALGO_PHASECAL_LIM                       0x30
+#define ALGO_PHASECAL_CONFIG_TIMEOUT            0x30
+
+#define GLOBAL_CONFIG_VCSEL_WIDTH               0x32
+#define FINAL_RANGE_CONFIG_VALID_PHASE_LOW      0x47
+#define FINAL_RANGE_CONFIG_VALID_PHASE_HIGH     0x48
 
 #define PRE_RANGE_CONFIG_VCSEL_PERIOD           0x50
 #define PRE_RANGE_CONFIG_TIMEOUT_MACROP_HI      0x51
+#define PRE_RANGE_CONFIG_VALID_PHASE_LOW        0x56
+#define PRE_RANGE_CONFIG_VALID_PHASE_HIGH       0x57
+
 #define REG_MSRC_CONFIG_CONTROL                 0x60
 #define FINAL_RANGE_CONFIG_VCSEL_PERIOD         0x70
 #define FINAL_RANGE_CONFIG_TIMEOUT_MACROP_HI    0x71
@@ -76,14 +94,14 @@ typedef struct tagSequenceStepTimeouts
 // reads the calibration data and sets the device
 // into auto sensing mode
 //
-int tofInit(int iChan, int iAddr)
+int tofInit(int iChan, int iAddr, int bLongRange)
 {
 char filename[32];
 
 	sprintf(filename,"/dev/i2c-%d", iChan);
 	if ((file_i2c = open(filename, O_RDWR)) < 0)
 	{
-		fprintf(stderr, "Failed to open the i2c bus\n");
+		fprintf(stderr, "Failed to open the i2c bus; need to run as sudo?\n");
 		return 0;
 	}
 
@@ -95,7 +113,7 @@ char filename[32];
 		return 0;
 	}
 
-	return initSensor(); // finally, initialize the magic numbers in the sensor
+	return initSensor(bLongRange); // finally, initialize the magic numbers in the sensor
 
 } /* tofInit() */
 
@@ -222,7 +240,6 @@ unsigned char ucDefTuning[] = {80, 0xff,0x01, 0x00,0x00, 0xff,0x00, 0x09,0x00,
 0x72,0xfe, 0x76,0x00, 0x77,0x00, 0xff,0x01, 0x0d,0x01, 0xff,0x00, 0x80,0x01,
 0x01,0xf8, 0xff,0x01, 0x8e,0x01, 0x00,0x01, 0xff,0x00, 0x80,0x00};
 
-
 static int getSpadInfo(unsigned char *pCount, unsigned char *pTypeIsAperture)
 {
 int iTimeout;
@@ -340,6 +357,189 @@ static void getSequenceStepTimeouts(uint8_t enables, SequenceStepTimeouts * time
     timeoutMclksToMicroseconds(timeouts->final_range_mclks,
                                timeouts->final_range_vcsel_period_pclks);
 } /* getSequenceStepTimeouts() */
+
+
+// Set the VCSEL (vertical cavity surface emitting laser) pulse period for the
+// given period type (pre-range or final range) to the given value in PCLKs.
+// Longer periods seem to increase the potential range of the sensor.
+// Valid values are (even numbers only):
+//  pre:  12 to 18 (initialized default: 14)
+//  final: 8 to 14 (initialized default: 10)
+// based on VL53L0X_set_vcsel_pulse_period()
+static int setVcselPulsePeriod(vcselPeriodType type, uint8_t period_pclks)
+{
+  uint8_t vcsel_period_reg = encodeVcselPeriod(period_pclks);
+
+  uint8_t enables;
+  SequenceStepTimeouts timeouts;
+
+  enables = readReg(SYSTEM_SEQUENCE_CONFIG);
+  getSequenceStepTimeouts(enables, &timeouts);
+
+  // "Apply specific settings for the requested clock period"
+  // "Re-calculate and apply timeouts, in macro periods"
+
+  // "When the VCSEL period for the pre or final range is changed,
+  // the corresponding timeout must be read from the device using
+  // the current VCSEL period, then the new VCSEL period can be
+  // applied. The timeout then must be written back to the device
+  // using the new VCSEL period.
+  //
+  // For the MSRC timeout, the same applies - this timeout being
+  // dependant on the pre-range vcsel period."
+
+
+  if (type == VcselPeriodPreRange)
+  {
+    // "Set phase check limits"
+    switch (period_pclks)
+    {
+      case 12:
+        writeReg(PRE_RANGE_CONFIG_VALID_PHASE_HIGH, 0x18);
+        break;
+
+      case 14:
+        writeReg(PRE_RANGE_CONFIG_VALID_PHASE_HIGH, 0x30);
+        break;
+
+      case 16:
+        writeReg(PRE_RANGE_CONFIG_VALID_PHASE_HIGH, 0x40);
+        break;
+
+      case 18:
+        writeReg(PRE_RANGE_CONFIG_VALID_PHASE_HIGH, 0x50);
+        break;
+
+      default:
+        // invalid period
+        return 0;
+    }
+    writeReg(PRE_RANGE_CONFIG_VALID_PHASE_LOW, 0x08);
+
+    // apply new VCSEL period
+    writeReg(PRE_RANGE_CONFIG_VCSEL_PERIOD, vcsel_period_reg);
+
+    // update timeouts
+
+    // set_sequence_step_timeout() begin
+    // (SequenceStepId == VL53L0X_SEQUENCESTEP_PRE_RANGE)
+
+    uint16_t new_pre_range_timeout_mclks =
+      timeoutMicrosecondsToMclks(timeouts.pre_range_us, period_pclks);
+
+    writeReg16(PRE_RANGE_CONFIG_TIMEOUT_MACROP_HI,
+      encodeTimeout(new_pre_range_timeout_mclks));
+
+    // set_sequence_step_timeout() end
+
+    // set_sequence_step_timeout() begin
+    // (SequenceStepId == VL53L0X_SEQUENCESTEP_MSRC)
+
+    uint16_t new_msrc_timeout_mclks =
+      timeoutMicrosecondsToMclks(timeouts.msrc_dss_tcc_us, period_pclks);
+
+    writeReg(MSRC_CONFIG_TIMEOUT_MACROP,
+      (new_msrc_timeout_mclks > 256) ? 255 : (new_msrc_timeout_mclks - 1));
+
+    // set_sequence_step_timeout() end
+  }
+  else if (type == VcselPeriodFinalRange)
+  {
+    switch (period_pclks)
+    {
+      case 8:
+        writeReg(FINAL_RANGE_CONFIG_VALID_PHASE_HIGH, 0x10);
+        writeReg(FINAL_RANGE_CONFIG_VALID_PHASE_LOW,  0x08);
+        writeReg(GLOBAL_CONFIG_VCSEL_WIDTH, 0x02);
+        writeReg(ALGO_PHASECAL_CONFIG_TIMEOUT, 0x0C);
+        writeReg(0xFF, 0x01);
+        writeReg(ALGO_PHASECAL_LIM, 0x30);
+        writeReg(0xFF, 0x00);
+        break;
+
+      case 10:
+        writeReg(FINAL_RANGE_CONFIG_VALID_PHASE_HIGH, 0x28);
+        writeReg(FINAL_RANGE_CONFIG_VALID_PHASE_LOW,  0x08);
+        writeReg(GLOBAL_CONFIG_VCSEL_WIDTH, 0x03);
+        writeReg(ALGO_PHASECAL_CONFIG_TIMEOUT, 0x09);
+        writeReg(0xFF, 0x01);
+        writeReg(ALGO_PHASECAL_LIM, 0x20);
+        writeReg(0xFF, 0x00);
+        break;
+
+      case 12:
+        writeReg(FINAL_RANGE_CONFIG_VALID_PHASE_HIGH, 0x38);
+        writeReg(FINAL_RANGE_CONFIG_VALID_PHASE_LOW,  0x08);
+        writeReg(GLOBAL_CONFIG_VCSEL_WIDTH, 0x03);
+        writeReg(ALGO_PHASECAL_CONFIG_TIMEOUT, 0x08);
+        writeReg(0xFF, 0x01);
+        writeReg(ALGO_PHASECAL_LIM, 0x20);
+        writeReg(0xFF, 0x00);
+        break;
+
+      case 14:
+        writeReg(FINAL_RANGE_CONFIG_VALID_PHASE_HIGH, 0x48);
+        writeReg(FINAL_RANGE_CONFIG_VALID_PHASE_LOW,  0x08);
+        writeReg(GLOBAL_CONFIG_VCSEL_WIDTH, 0x03);
+        writeReg(ALGO_PHASECAL_CONFIG_TIMEOUT, 0x07);
+        writeReg(0xFF, 0x01);
+        writeReg(ALGO_PHASECAL_LIM, 0x20);
+        writeReg(0xFF, 0x00);
+        break;
+
+      default:
+        // invalid period
+        return 0;
+    }
+
+    // apply new VCSEL period
+    writeReg(FINAL_RANGE_CONFIG_VCSEL_PERIOD, vcsel_period_reg);
+
+    // update timeouts
+
+    // set_sequence_step_timeout() begin
+    // (SequenceStepId == VL53L0X_SEQUENCESTEP_FINAL_RANGE)
+
+    // "For the final range timeout, the pre-range timeout
+    //  must be added. To do this both final and pre-range
+    //  timeouts must be expressed in macro periods MClks
+    //  because they have different vcsel periods."
+
+    uint16_t new_final_range_timeout_mclks =
+      timeoutMicrosecondsToMclks(timeouts.final_range_us, period_pclks);
+
+    if (enables & SEQUENCE_ENABLE_PRE_RANGE)
+    {
+      new_final_range_timeout_mclks += timeouts.pre_range_mclks;
+    }
+
+    writeReg16(FINAL_RANGE_CONFIG_TIMEOUT_MACROP_HI,
+    encodeTimeout(new_final_range_timeout_mclks));
+
+    // set_sequence_step_timeout end
+  }
+  else
+  {
+    // invalid type
+    return 0;
+  }
+
+  // "Finally, the timing budget must be re-applied"
+
+  setMeasurementTimingBudget(measurement_timing_budget_us);
+
+  // "Perform the phase calibration. This is needed after changing on vcsel period."
+  // VL53L0X_perform_phase_calibration() begin
+
+  uint8_t sequence_config = readReg(SYSTEM_SEQUENCE_CONFIG);
+  writeReg(SYSTEM_SEQUENCE_CONFIG, 0x02);
+  performSingleRefCalibration(0x0);
+  writeReg(SYSTEM_SEQUENCE_CONFIG, sequence_config);
+
+  // VL53L0X_perform_phase_calibration() end
+
+  return 1;
+}
 
 // Set the measurement timing budget in microseconds, which is the time allowed
 // for one measurement; the ST API and this library take care of splitting the
@@ -508,7 +708,7 @@ int iTimeout;
 //
 // Initialize the vl53l0x
 //
-static int initSensor(void)
+static int initSensor(int bLongRangeMode)
 {
 unsigned char spad_count=0, spad_type_is_aperture=0, ref_spad_map[6];
 unsigned char ucFirstSPAD, ucSPADsEnabled;
@@ -516,7 +716,7 @@ int i;
 
 // set 2.8V mode
   writeReg(VHV_CONFIG_PAD_SCL_SDA__EXTSUP_HV,
-      readReg(VHV_CONFIG_PAD_SCL_SDA__EXTSUP_HV) | 0x01); // set bit 0
+  readReg(VHV_CONFIG_PAD_SCL_SDA__EXTSUP_HV) | 0x01); // set bit 0
 // Set I2C standard mode
   writeRegList(ucI2CMode);
   stop_variable = readReg(0x91);
@@ -551,6 +751,15 @@ int i;
 
 // load default tuning settings
   writeRegList(ucDefTuning); // long list of magic numbers
+
+// change some settings for long range mode
+  if (bLongRangeMode)
+  {
+	writeReg16(FINAL_RANGE_CONFIG_MIN_COUNT_RATE_RTN_LIMIT, 13); // 0.1
+	setVcselPulsePeriod(VcselPeriodPreRange, 18);
+	setVcselPulsePeriod(VcselPeriodFinalRange, 14);
+  }
+
 // set interrupt configuration to "new sample ready"
   writeReg(SYSTEM_INTERRUPT_CONFIG_GPIO, 0x04);
   writeReg(GPIO_HV_MUX_ACTIVE_HIGH, readReg(GPIO_HV_MUX_ACTIVE_HIGH) & ~0x10); // active low

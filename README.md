@@ -11,3 +11,9 @@ and low cost of the sensor make it a valuable addition to the IoT world, but
 ST Micro's attempt to obfuscate the interface and control the software goes
 against the open nature of the community.
 
+This code puts the sensor into continous sample mode and allows selection
+between the default mode (30-800mm) and the long range mode (30-2000mm).
+
+From my limited testing, it appears to give accurate results in the range
+40-600mm. Beyond that and the results are less accurate and more prone to being
+interfered with by ambient light.
